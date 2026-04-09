@@ -1,0 +1,89 @@
+"""Configuration for pairs trading / arbitrage bot."""
+
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from typing import Dict, List, Tuple
+
+
+class PairConfig:
+    """Configuration for a single trading pair."""
+
+    def __init__(
+        self,
+        leg_a: str,
+        leg_b: str,
+        leg_a_lot: float,
+        leg_b_lot: float,
+        zscore_entry: float = 2.0,
+        zscore_exit: float = 0.5,
+        zscore_stop: float = 3.5,
+        lookback: int = 100,
+        session_hours: List[Tuple[int, int]] | None = None,
+        max_hold_minutes: int = 60,
+    ):
+        self.leg_a = leg_a  # e.g. "BTCUSD"
+        self.leg_b = leg_b  # e.g. "ETHUSD"
+        self.leg_a_lot = leg_a_lot
+        self.leg_b_lot = leg_b_lot
+        self.zscore_entry = zscore_entry
+        self.zscore_exit = zscore_exit
+        self.zscore_stop = zscore_stop
+        self.lookback = lookback  # bars for spread mean/std
+        self.session_hours = session_hours  # None = 24/7
+        self.max_hold_minutes = max_hold_minutes
+
+
+class Settings(BaseSettings):
+    """Global settings."""
+
+    # MT5
+    mt5_login: int = 0
+    mt5_password: str = ""
+    mt5_server: str = ""
+    mt5_path: str = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+
+    # Risk
+    max_daily_loss: float = 50.0
+    max_open_pairs: int = 3
+    min_correlation: float = 0.80  # don't trade if correlation drops below
+
+    # Scanning
+    scan_interval_seconds: int = 15  # how often to check for signals
+    timeframe: str = "M1"  # M1 for faster signals (was M5)
+    spread_lookback: int = 50  # bars for Z-score (was 100)
+
+    # Pairs — configured in code, not env
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
+
+# --- Pair definitions ---
+
+PAIRS = [
+    PairConfig(
+        leg_a="BTCUSD",
+        leg_b="ETHUSD",
+        leg_a_lot=0.04,
+        leg_b_lot=0.8,
+        zscore_entry=1.0,       # was 2.0 — too rare, ~1 signal/day
+        zscore_exit=0.2,        # was 0.5 — tighter exit for quick scalps
+        zscore_stop=2.5,        # was 3.5 — cut losses sooner
+        lookback=50,            # was 100 — shorter window = more sensitive
+        session_hours=None,     # 24/7
+        max_hold_minutes=30,    # was 60 — faster turnover for more trades
+    ),
+    PairConfig(
+        leg_a="XAUUSD",
+        leg_b="XAGUSD",
+        leg_a_lot=0.01,
+        leg_b_lot=0.1,
+        zscore_entry=1.0,       # was 2.0
+        zscore_exit=0.2,        # was 0.5
+        zscore_stop=2.5,        # was 3.5
+        lookback=50,            # was 100
+        session_hours=[(7, 17)],  # London + NY
+        max_hold_minutes=30,    # was 45
+    ),
+]
+
+
+settings = Settings()
