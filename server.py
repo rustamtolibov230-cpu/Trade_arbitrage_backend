@@ -11,17 +11,20 @@ from pathlib import Path
 from typing import Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from config.settings import settings, PAIRS
 from src.mt5_client import MT5Client
+from src.schemas import PairSignal
 from src.spread_tracker import SpreadTracker
 from src.execution import ExecutionEngine
 from src.risk_manager import RiskManager
 
 # --- Logging ---
+os.makedirs("logs", exist_ok=True)
 logger.remove()
 logger.add(
     sys.stdout,
@@ -38,15 +41,20 @@ logger.add(
 # --- App ---
 app = FastAPI(title="Trade Arbitrage")
 
-# Serve frontend static files — works from both dev and PyInstaller exe
-if getattr(sys, 'frozen', False):
-    _base = Path(sys._MEIPASS)
-else:
-    _base = Path(__file__).parent
+# CORS — allows standalone frontend to connect from any origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-FRONTEND_DIR = _base / "frontend"
-if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+# Optionally serve frontend if it exists next to the server
+if getattr(sys, 'frozen', False):
+    _exe_dir = Path(os.path.dirname(os.path.abspath(sys.executable)))
+    FRONTEND_DIR = _exe_dir / "frontend"
+else:
+    FRONTEND_DIR = Path(__file__).parent / "frontend"
 
 # --- Bot components ---
 mt5_client = MT5Client()
@@ -93,10 +101,21 @@ async def websocket_endpoint(ws: WebSocket):
 # --- REST endpoints ---
 @app.get("/")
 async def dashboard():
+    """Serve frontend if it exists next to server, otherwise show API info."""
     index = FRONTEND_DIR / "index.html"
     if index.exists():
-        return FileResponse(str(index))
-    return HTMLResponse("<h1>Trade Arbitrage</h1><p>Frontend not found</p>")
+        from fastapi.responses import Response
+        content = index.read_bytes()
+        return Response(
+            content=content,
+            media_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+    return HTMLResponse(
+        "<h1>Trade Arbitrage API</h1>"
+        "<p>Backend running. Open <code>frontend/index.html</code> in your browser.</p>"
+        "<p>API: /api/status, /api/spreads, /api/history, /api/start, /api/stop</p>"
+    )
 
 
 @app.get("/api/status")
@@ -159,6 +178,7 @@ async def api_start():
     global _bot_task, _bot_running
     if _bot_running:
         return {"status": "already_running"}
+    _bot_running = True  # set BEFORE creating task to prevent double-start race
     _bot_task = asyncio.create_task(bot_loop())
     await broadcast({"type": "bot_state", "running": True})
     logger.info("Bot STARTED by dashboard")
@@ -195,7 +215,6 @@ async def bot_loop():
     while _bot_running:
         try:
             cycle += 1
-            spreads_data = []
 
             for tracker in trackers:
                 state = await tracker.compute_spread(
@@ -208,19 +227,16 @@ async def bot_loop():
                 is_open = execution.has_open_pair(state.pair_name)
                 pnl = await execution.get_pair_pnl(state.pair_name) if is_open else None
 
-                # Collect for broadcast
-                spreads_data.append({
-                    "pair": state.pair_name,
-                    "zscore": round(state.zscore, 3),
-                    "correlation": round(state.correlation, 4),
-                    "ratio": round(state.ratio, 6),
-                    "mean": round(state.mean, 6),
-                    "std": round(state.std, 6),
-                    "is_open": is_open,
-                    "pnl": round(pnl, 2) if pnl is not None else None,
-                })
+                # Console status per pair
+                status_tag = f"[OPEN P&L=${pnl:.2f}]" if is_open else "[watching]"
+                corr_warn = " !!LOW_CORR!!" if state.correlation < settings.min_correlation else ""
+                logger.info(
+                    f"  {tracker.pair_name} {status_tag} | "
+                    f"Z={state.zscore:+.3f} (entry±{tracker.cfg.zscore_entry}) | "
+                    f"corr={state.correlation:.3f}{corr_warn}"
+                )
 
-                # Generate signal
+                # Generate signal (Z-score entry or emergency stop)
                 signal_obj = tracker.generate_signal(state, is_open)
                 if signal_obj is None:
                     continue
@@ -229,7 +245,7 @@ async def bot_loop():
                 if signal_obj.action.startswith("OPEN"):
                     ok, reason = risk_mgr.can_open_pair(state)
                     if not ok:
-                        logger.warning(f"Risk blocked: {reason}")
+                        logger.warning(f"  BLOCKED {tracker.pair_name}: {reason}")
                         await broadcast({
                             "type": "risk_block",
                             "pair": state.pair_name,
@@ -240,7 +256,6 @@ async def bot_loop():
                 # Execute
                 logger.info(f">>> {signal_obj.action} | {signal_obj.reason}")
                 success = await execution.execute_signal(signal_obj)
-
                 await broadcast({
                     "type": "signal",
                     "pair": signal_obj.pair_name,
@@ -250,54 +265,10 @@ async def bot_loop():
                     "executed": success,
                 })
 
-            # Check timeouts
-            await _check_timeouts()
-
-            # Risk monitoring
-            await risk_mgr.check_active_pairs()
-
-            # Daily loss circuit breaker
-            daily_pnl = execution.get_daily_pnl()
-            if daily_pnl <= -settings.max_daily_loss:
-                logger.error(f"DAILY LOSS LIMIT: ${daily_pnl:.2f}")
-                await execution.close_all("daily_loss_limit")
-                await broadcast({"type": "circuit_breaker", "daily_pnl": daily_pnl})
-
-            # Broadcast state update
-            stats = execution.get_stats()
-            await broadcast({
-                "type": "update",
-                "spreads": spreads_data,
-                "stats": stats,
-                "daily_pnl": round(daily_pnl, 2),
-                "active_count": len(execution.active_pairs),
-                "cycle": cycle,
-            })
-
         except Exception as e:
             logger.exception(f"Bot loop error: {e}")
 
         await asyncio.sleep(settings.scan_interval_seconds)
-
-
-async def _check_timeouts():
-    """Close pairs that exceeded max hold time."""
-    now = datetime.now(timezone.utc)
-    timeout_map = {f"{c.leg_a}/{c.leg_b}": c.max_hold_minutes for c in PAIRS}
-
-    for pair_name, pair in list(execution.active_pairs.items()):
-        hold_min = (now - pair.entry_time).total_seconds() / 60
-        max_hold = timeout_map.get(pair_name, 60)
-        if hold_min >= max_hold:
-            from src.schemas import PairSignal
-            sig = PairSignal(
-                pair_name=pair_name, action="CLOSE", zscore=0,
-                leg_a=pair.leg_a, leg_b=pair.leg_b,
-                leg_a_side="", leg_b_side="",
-                leg_a_lot=0, leg_b_lot=0,
-                reason=f"Timeout ({hold_min:.0f}m > {max_hold}m)",
-            )
-            await execution.execute_signal(sig)
 
 
 @app.on_event("startup")
@@ -306,13 +277,220 @@ async def on_startup():
     connected = await mt5_client.connect()
     if not connected:
         logger.error("MT5 connection failed!")
-        return
 
     account = await mt5_client.get_account_info()
     if account:
         risk_mgr.set_start_balance(account["balance"])
 
+    # Always-on tasks — run even when bot is stopped
+    asyncio.create_task(display_loop())
+    asyncio.create_task(trade_monitor_task())
+
     logger.info("Server ready on http://localhost:8050 — waiting for Start")
+
+
+# --- Always-on MT5 Trade Monitor ---
+# Checks profit targets and timeouts every 3s, even when bot is stopped.
+# This is the ONLY place that closes positions — bot_loop only opens them.
+
+_profit_target_map = {f"{c.leg_a}/{c.leg_b}": c.profit_target for c in PAIRS}
+_timeout_map = {f"{c.leg_a}/{c.leg_b}": c.max_hold_minutes for c in PAIRS}
+
+
+async def trade_monitor_task():
+    """Always-on task: monitors open pairs in MT5 and closes on profit target / timeout."""
+    global _bot_running
+    logger.info("Trade monitor task started (always-on)")
+
+    while True:
+        try:
+            if execution.active_pairs:
+                for pair_name in list(execution.active_pairs.keys()):
+                    pair = execution.active_pairs.get(pair_name)
+                    if pair is None:
+                        continue
+
+                    # Get live P&L from MT5
+                    pnl = await execution.get_pair_pnl(pair_name)
+                    if pnl is not None:
+                        # Track max/min P&L
+                        if pnl > pair.max_profit:
+                            pair.max_profit = pnl
+                        if pnl < pair.min_profit:
+                            pair.min_profit = pnl
+
+                    # --- Profit target ---
+                    target = _profit_target_map.get(pair_name, 1.0)
+                    if pnl is not None and pnl >= target:
+                        sig = PairSignal(
+                            pair_name=pair_name, action="CLOSE", zscore=0,
+                            leg_a=pair.leg_a, leg_b=pair.leg_b,
+                            leg_a_side="", leg_b_side="",
+                            leg_a_lot=0, leg_b_lot=0,
+                            reason=f"Profit target hit (P&L=${pnl:.2f} >= ${target:.2f})",
+                        )
+                        logger.info(f">>> PROFIT TARGET | {sig.reason}")
+                        success = await execution.execute_signal(sig)
+                        await broadcast({
+                            "type": "signal",
+                            "pair": pair_name,
+                            "action": "CLOSE",
+                            "zscore": 0,
+                            "reason": sig.reason,
+                            "executed": success,
+                        })
+                        continue
+
+                    # --- Timeout ---
+                    hold_min = (datetime.now(timezone.utc) - pair.entry_time).total_seconds() / 60
+                    max_hold = _timeout_map.get(pair_name, 60)
+                    if hold_min >= max_hold:
+                        sig = PairSignal(
+                            pair_name=pair_name, action="CLOSE", zscore=0,
+                            leg_a=pair.leg_a, leg_b=pair.leg_b,
+                            leg_a_side="", leg_b_side="",
+                            leg_a_lot=0, leg_b_lot=0,
+                            reason=f"Timeout ({hold_min:.0f}m > {max_hold}m)",
+                        )
+                        logger.info(f">>> TIMEOUT | {sig.reason}")
+                        await execution.execute_signal(sig)
+                        await broadcast({
+                            "type": "signal",
+                            "pair": pair_name,
+                            "action": "CLOSE",
+                            "zscore": 0,
+                            "reason": sig.reason,
+                            "executed": True,
+                        })
+                        continue
+
+                    # Log P&L status
+                    pnl_str = f"${pnl:.2f}" if pnl is not None else "N/A"
+                    logger.debug(f"  [MONITOR] {pair_name}: P&L={pnl_str} | held {hold_min:.0f}m | target=${target:.2f}")
+
+                # Daily loss circuit breaker
+                daily_pnl = execution.get_daily_pnl()
+                if daily_pnl <= -settings.max_daily_loss:
+                    logger.error(f"DAILY LOSS LIMIT: ${daily_pnl:.2f}")
+                    await execution.close_all("daily_loss_limit")
+                    await broadcast({"type": "circuit_breaker", "daily_pnl": daily_pnl})
+                    _bot_running = False
+
+        except Exception as e:
+            logger.error(f"Trade monitor error: {e}")
+
+        await asyncio.sleep(3)  # Check every 3 seconds
+
+
+_last_spreads = []
+
+
+async def _compute_spreads_data() -> list:
+    """Compute spread data for all pairs — shared by display_loop and REST."""
+    global _last_spreads
+    spreads_data = []
+    for tracker in trackers:
+        try:
+            state = await tracker.compute_spread(
+                timeframe=settings.timeframe,
+                lookback=settings.spread_lookback,
+            )
+        except Exception as e:
+            logger.error(f"compute_spread failed for {tracker.pair_name}: {e}")
+            continue
+        if state is None:
+            continue
+        is_open = execution.has_open_pair(state.pair_name)
+        pnl = await execution.get_pair_pnl(state.pair_name) if is_open else None
+        spreads_data.append({
+            "pair": state.pair_name,
+            "zscore": round(state.zscore, 3),
+            "correlation": round(state.correlation, 4),
+            "ratio": round(state.ratio, 6),
+            "mean": round(state.mean, 6),
+            "std": round(state.std, 6),
+            "is_open": is_open,
+            "pnl": round(pnl, 2) if pnl is not None else None,
+            "in_session": tracker._is_in_session(),
+        })
+    _last_spreads = spreads_data
+    return spreads_data
+
+
+@app.get("/api/spreads")
+async def api_spreads():
+    """REST endpoint — dashboard fetches this on page load."""
+    spreads = await _compute_spreads_data()
+    stats = execution.get_stats()
+    daily_pnl = execution.get_daily_pnl()
+    return {
+        "type": "update",
+        "spreads": spreads,
+        "stats": stats,
+        "daily_pnl": round(daily_pnl, 2),
+        "active_count": len(execution.active_pairs),
+        "cycle": 0,
+    }
+
+
+async def display_loop():
+    """Broadcasts full dashboard state every 5s, always running."""
+    logger.info("Display loop started")
+    _cycle = 0
+    while True:
+        try:
+            if ws_clients:
+                _cycle += 1
+                spreads_data = await _compute_spreads_data()
+                account = await mt5_client.get_account_info()
+                stats = execution.get_stats()
+                daily_pnl = execution.get_daily_pnl()
+
+                # Active pairs with live P&L
+                active = []
+                for name, pair in execution.active_pairs.items():
+                    pnl = await execution.get_pair_pnl(name)
+                    hold_min = (datetime.now(timezone.utc) - pair.entry_time).total_seconds() / 60
+                    active.append({
+                        "pair": name,
+                        "leg_a_side": pair.leg_a_side,
+                        "leg_b_side": pair.leg_b_side,
+                        "entry_zscore": round(pair.entry_zscore, 2),
+                        "pnl": round(pnl, 2) if pnl is not None else 0,
+                        "hold_min": round(hold_min, 1),
+                        "max_profit": round(pair.max_profit, 2),
+                        "min_profit": round(pair.min_profit, 2),
+                    })
+
+                # Trade history (last 50)
+                history = [
+                    {
+                        "pair": t.pair_name,
+                        "profit": round(t.profit, 2),
+                        "hold_min": round(t.hold_minutes, 1),
+                        "entry_z": round(t.entry_zscore, 2),
+                        "exit_z": round(t.exit_zscore, 2),
+                        "reason": t.reason,
+                        "time": t.exit_time.strftime("%H:%M:%S"),
+                    }
+                    for t in reversed(execution.trade_history[-50:])
+                ]
+
+                await broadcast({
+                    "type": "update",
+                    "spreads": spreads_data,
+                    "account": account,
+                    "stats": stats,
+                    "daily_pnl": round(daily_pnl, 2),
+                    "active_count": len(execution.active_pairs),
+                    "active_pairs": active,
+                    "history": history,
+                    "bot_running": _bot_running,
+                    "cycle": _cycle,
+                })
+        except Exception as e:
+            logger.error(f"Display loop error: {e}")
+        await asyncio.sleep(5)
 
 
 @app.on_event("shutdown")

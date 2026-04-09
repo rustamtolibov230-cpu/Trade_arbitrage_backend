@@ -20,6 +20,7 @@ class PairConfig:
         lookback: int = 100,
         session_hours: List[Tuple[int, int]] | None = None,
         max_hold_minutes: int = 60,
+        profit_target: float = 1.0,  # close when combined P&L >= this ($)
     ):
         self.leg_a = leg_a  # e.g. "BTCUSD"
         self.leg_b = leg_b  # e.g. "ETHUSD"
@@ -31,6 +32,7 @@ class PairConfig:
         self.lookback = lookback  # bars for spread mean/std
         self.session_hours = session_hours  # None = 24/7
         self.max_hold_minutes = max_hold_minutes
+        self.profit_target = profit_target  # $ profit to take
 
 
 class Settings(BaseSettings):
@@ -44,7 +46,7 @@ class Settings(BaseSettings):
 
     # Risk
     max_daily_loss: float = 50.0
-    max_open_pairs: int = 3
+    max_open_pairs: int = 1
     min_correlation: float = 0.80  # don't trade if correlation drops below
 
     # Scanning
@@ -64,24 +66,26 @@ PAIRS = [
         leg_b="ETHUSD",
         leg_a_lot=0.04,
         leg_b_lot=0.8,
-        zscore_entry=1.0,       # was 2.0 — too rare, ~1 signal/day
-        zscore_exit=0.2,        # was 0.5 — tighter exit for quick scalps
-        zscore_stop=2.5,        # was 3.5 — cut losses sooner
-        lookback=50,            # was 100 — shorter window = more sensitive
+        zscore_entry=1.0,       # enter when spread is 1 std dev wide
+        zscore_exit=0.2,        # fallback: close if Z reverts but profit not hit
+        zscore_stop=2.5,        # emergency stop if spread keeps widening
+        lookback=50,
         session_hours=None,     # 24/7
-        max_hold_minutes=30,    # was 60 — faster turnover for more trades
+        max_hold_minutes=30,
+        profit_target=1.0,      # primary exit: close when combined P&L >= +$1
     ),
     PairConfig(
         leg_a="XAUUSD",
         leg_b="XAGUSD",
         leg_a_lot=0.01,
         leg_b_lot=0.1,
-        zscore_entry=1.0,       # was 2.0
-        zscore_exit=0.2,        # was 0.5
-        zscore_stop=2.5,        # was 3.5
-        lookback=50,            # was 100
+        zscore_entry=1.0,
+        zscore_exit=0.2,        # fallback Z-score exit
+        zscore_stop=2.5,        # emergency stop
+        lookback=50,
         session_hours=[(7, 17)],  # London + NY
-        max_hold_minutes=30,    # was 45
+        max_hold_minutes=30,
+        profit_target=1.0,      # primary exit: close when combined P&L >= +$1
     ),
 ]
 

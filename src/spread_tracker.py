@@ -33,15 +33,20 @@ class SpreadTracker:
 
     async def compute_spread(self, timeframe: str, lookback: int) -> Optional[SpreadState]:
         """Fetch prices for both legs and compute spread statistics."""
-        if not self._is_in_session():
-            return None
+        # Session check moved to generate_signal — we always compute for display
 
         # Fetch bars for both legs
         bars_a = await self.mt5.get_rates(self.cfg.leg_a, timeframe, lookback + 50)
         bars_b = await self.mt5.get_rates(self.cfg.leg_b, timeframe, lookback + 50)
 
         if bars_a is None or bars_b is None:
-            logger.warning(f"Missing data for {self.pair_name}")
+            missing = []
+            if bars_a is None: missing.append(self.cfg.leg_a)
+            if bars_b is None: missing.append(self.cfg.leg_b)
+            logger.error(
+                f"{self.pair_name}: no bars for {missing} — "
+                f"check symbol names in MT5 (Market Watch must have them)"
+            )
             return None
 
         # Align by time
@@ -110,20 +115,7 @@ class SpreadTracker:
 
         # --- Exit signals (if we have a position) ---
         if has_open_position:
-            if abs(z) <= self.cfg.zscore_exit:
-                return PairSignal(
-                    pair_name=self.pair_name,
-                    action="CLOSE",
-                    zscore=z,
-                    leg_a=self.cfg.leg_a,
-                    leg_b=self.cfg.leg_b,
-                    leg_a_side="",
-                    leg_b_side="",
-                    leg_a_lot=0,
-                    leg_b_lot=0,
-                    reason=f"Mean reverted (Z={z:.2f})",
-                )
-
+            # Z-score stop: spread keeps widening (emergency exit, not P&L based)
             if abs(z) >= self.cfg.zscore_stop:
                 return PairSignal(
                     pair_name=self.pair_name,
@@ -141,13 +133,15 @@ class SpreadTracker:
             return None  # hold
 
         # --- Entry signals (no position) ---
-        # Spread is too wide → expect mean reversion
+        if not self._is_in_session():
+            return None  # outside trading session — show data but don't trade
+
+        # The configured lots are already manually calibrated for dollar-neutral
+        # exposure (e.g. 0.04 BTC / 0.80 ETH ≈ equal dollar ATR exposure).
+        # We use them directly — no additional ATR multiplier.
         if z >= self.cfg.zscore_entry:
             # Ratio is high → leg_a overpriced relative to leg_b
             # SHORT leg_a, LONG leg_b
-            adjusted_b_lot = round(
-                self.cfg.leg_b_lot * state.hedge_ratio, 2
-            )
             return PairSignal(
                 pair_name=self.pair_name,
                 action="OPEN_SHORT_SPREAD",
@@ -157,16 +151,13 @@ class SpreadTracker:
                 leg_a_side="SELL",
                 leg_b_side="BUY",
                 leg_a_lot=self.cfg.leg_a_lot,
-                leg_b_lot=max(adjusted_b_lot, self.cfg.leg_b_lot),
+                leg_b_lot=self.cfg.leg_b_lot,
                 reason=f"Spread wide (Z={z:.2f}), short A / long B",
             )
 
         if z <= -self.cfg.zscore_entry:
             # Ratio is low → leg_a underpriced relative to leg_b
             # LONG leg_a, SHORT leg_b
-            adjusted_b_lot = round(
-                self.cfg.leg_b_lot * state.hedge_ratio, 2
-            )
             return PairSignal(
                 pair_name=self.pair_name,
                 action="OPEN_LONG_SPREAD",
@@ -176,7 +167,7 @@ class SpreadTracker:
                 leg_a_side="BUY",
                 leg_b_side="SELL",
                 leg_a_lot=self.cfg.leg_a_lot,
-                leg_b_lot=max(adjusted_b_lot, self.cfg.leg_b_lot),
+                leg_b_lot=self.cfg.leg_b_lot,
                 reason=f"Spread wide (Z={z:.2f}), long A / short B",
             )
 

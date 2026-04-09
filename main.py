@@ -101,23 +101,25 @@ class ArbitrageBot:
                         continue  # out of session or no data
 
                     is_open = self.execution.has_open_pair(state.pair_name)
+                    pnl = await self.execution.get_pair_pnl(state.pair_name) if is_open else None
 
                     # Log spread state
                     status = "OPEN" if is_open else "    "
+                    pnl_str = f" P&L=${pnl:.2f}" if pnl is not None else ""
                     logger.info(
                         f"[{now}] {status} {state.pair_name} | "
                         f"Z={state.zscore:+.2f} | "
                         f"corr={state.correlation:.3f} | "
-                        f"ratio={state.ratio:.4f}"
+                        f"ratio={state.ratio:.4f}{pnl_str}"
                     )
 
-                    # --- 2. Generate signal ---
+                    # --- 2. Generate signal (Z-score stop, entries) ---
                     signal_obj = tracker.generate_signal(state, is_open)
 
                     if signal_obj is None:
                         continue
 
-                    # --- 3. Risk check (for entries) ---
+                    # --- 4. Risk check (for entries) ---
                     if signal_obj.action.startswith("OPEN"):
                         ok, reason = self.risk.can_open_pair(state)
                         if not ok:
@@ -126,11 +128,14 @@ class ArbitrageBot:
                             )
                             continue
 
-                    # --- 4. Execute ---
+                    # --- 5. Execute ---
                     logger.info(f">>> SIGNAL: {signal_obj.action} | {signal_obj.reason}")
                     await self.execution.execute_signal(signal_obj)
 
-                # --- 5. Check timeout on active pairs ---
+                # --- 5. Profit target check (independent of spread data) ---
+                await self._check_profit_targets()
+
+                # --- 6. Check timeout on active pairs ---
                 await self._check_timeouts()
 
                 # --- 6. Risk monitoring ---
@@ -168,6 +173,28 @@ class ArbitrageBot:
 
         # Shutdown
         await self.stop()
+
+    async def _check_profit_targets(self):
+        """Close pairs that hit their profit target — runs independently of spread data."""
+        profit_target_map = {f"{c.leg_a}/{c.leg_b}": c.profit_target for c in PAIRS}
+
+        for pair_name in list(self.execution.active_pairs.keys()):
+            pnl = await self.execution.get_pair_pnl(pair_name)
+            if pnl is None:
+                continue
+            target = profit_target_map.get(pair_name, 1.0)
+            if pnl >= target:
+                pair = self.execution.active_pairs[pair_name]
+                from src.schemas import PairSignal
+                sig = PairSignal(
+                    pair_name=pair_name, action="CLOSE", zscore=0,
+                    leg_a=pair.leg_a, leg_b=pair.leg_b,
+                    leg_a_side="", leg_b_side="",
+                    leg_a_lot=0, leg_b_lot=0,
+                    reason=f"Profit target hit (P&L=${pnl:.2f} >= ${target:.2f})",
+                )
+                logger.info(f">>> PROFIT TARGET | {sig.reason}")
+                await self.execution.execute_signal(sig)
 
     async def _check_timeouts(self):
         """Close pairs that exceeded max hold time."""

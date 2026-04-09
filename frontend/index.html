@@ -465,7 +465,7 @@
                 <span style="font-size:12px;color:#64748b" id="cycleCount">#0</span>
             </div>
             <div class="panel-body" id="spreadsContainer">
-                <div class="empty">Press START to begin scanning</div>
+                <div class="empty">Connecting to server...</div>
             </div>
         </div>
 
@@ -503,6 +503,17 @@
 </div>
 
 <script>
+    // ============================================================
+    // API CONNECTION
+    // Auto-detect: if served from backend, use same host.
+    // If opened as file://, fall back to localhost.
+    // ============================================================
+    const API_HOST = (location.protocol === 'file:' || !location.host)
+        ? '127.0.0.1:8050'
+        : location.host;
+    const API_BASE = `http://${API_HOST}`;
+    const WS_BASE  = `ws://${API_HOST}`;
+
     // --- State ---
     let ws = null;
     let signals = [];
@@ -521,13 +532,13 @@
                     btn.disabled = false;
                     return;
                 }
-                const res = await fetch('/api/stop', { method: 'POST' });
+                const res = await fetch(`${API_BASE}/api/stop`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'stopped' || data.status === 'already_stopped') {
                     setBotState(false);
                 }
             } else {
-                const res = await fetch('/api/start', { method: 'POST' });
+                const res = await fetch(`${API_BASE}/api/start`, { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'started' || data.status === 'already_running') {
                     setBotState(true);
@@ -535,6 +546,7 @@
             }
         } catch (e) {
             console.error('Toggle bot failed:', e);
+            alert('Failed to connect to backend at ' + API_BASE + '\n\nMake sure python run.py is running.');
         }
 
         btn.disabled = false;
@@ -563,27 +575,37 @@
 
     // --- WebSocket ---
     function connect() {
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${location.host}/ws`);
+        ws = new WebSocket(`${WS_BASE}/ws`);
 
         ws.onopen = () => {
             document.getElementById('connDot').classList.add('connected');
             document.getElementById('connText').textContent = 'Connected';
-            // Fetch initial state
-            fetch('/api/status').then(r => r.json()).then(data => {
+            // Fetch all data immediately on connect
+            fetch(`${API_BASE}/api/status`).then(r => r.json()).then(data => {
                 renderStatus(data);
                 setBotState(data.bot_running || false);
-            });
-            fetch('/api/history').then(r => r.json()).then(data => {
+            }).catch(e => console.error('status fetch failed:', e));
+
+            fetch(`${API_BASE}/api/history`).then(r => r.json()).then(data => {
                 tradeHistory = data;
                 renderHistory();
-            });
+            }).catch(e => console.error('history fetch failed:', e));
+
+            fetch(`${API_BASE}/api/spreads`).then(r => r.json()).then(data => {
+                handleMessage(data);
+            }).catch(e => console.error('spreads fetch failed:', e));
         };
 
         ws.onclose = () => {
             document.getElementById('connDot').classList.remove('connected');
             document.getElementById('connText').textContent = 'Reconnecting...';
             reconnectTimer = setTimeout(connect, 3000);
+        };
+
+        ws.onerror = () => {
+            document.getElementById('connText').textContent = 'Backend offline';
+            document.getElementById('spreadsContainer').innerHTML =
+                '<div class="empty">Cannot connect to backend at ' + API_HOST + '<br>Run: python run.py</div>';
         };
 
         ws.onmessage = (e) => {
@@ -597,15 +619,14 @@
             case 'update':
                 renderSpreads(data.spreads);
                 renderStatsFromUpdate(data);
+                if (data.account) renderAccount(data.account);
+                if (data.active_pairs) renderActivePairs(data.active_pairs);
+                if (data.history) { tradeHistory = data.history; renderHistory(); }
+                if (data.bot_running !== undefined) setBotState(data.bot_running);
                 document.getElementById('cycleCount').textContent = `#${data.cycle}`;
                 break;
             case 'signal':
                 addSignalLog(data);
-                fetch('/api/status').then(r => r.json()).then(renderStatus);
-                fetch('/api/history').then(r => r.json()).then(d => {
-                    tradeHistory = d;
-                    renderHistory();
-                });
                 break;
             case 'risk_block':
                 addSignalLog({
@@ -634,7 +655,7 @@
     function renderSpreads(spreads) {
         const container = document.getElementById('spreadsContainer');
         if (!spreads || spreads.length === 0) {
-            container.innerHTML = '<div class="empty">No spread data (out of session?)</div>';
+            container.innerHTML = '<div class="empty">No spread data (waiting for market data...)</div>';
             return;
         }
 
@@ -647,12 +668,15 @@
             const barPos = Math.max(0, Math.min(100, ((z + 4) / 8) * 100));
 
             const pnlStr = s.pnl !== null ? `<span class="${s.pnl >= 0 ? 'positive' : 'negative'}">$${s.pnl.toFixed(2)}</span>` : '';
+            const sessionBadge = s.in_session === false
+                ? `<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(100,116,139,0.2);color:#64748b;margin-left:8px">Out of session</span>`
+                : '';
 
             return `
-                <div class="spread-card">
+                <div class="spread-card" style="${s.in_session === false ? 'opacity:0.6' : ''}">
                     <div>
                         <div class="spread-name">
-                            ${s.pair} ${s.is_open ? pnlStr : ''}
+                            ${s.pair} ${s.is_open ? pnlStr : ''} ${sessionBadge}
                         </div>
                         <div class="spread-meta">
                             <span>Corr: ${s.correlation.toFixed(3)}</span>
@@ -686,16 +710,15 @@
         setPnlValue('statAvgPnl', s.avg_profit);
     }
 
-    function renderStatus(data) {
-        if (data.account) {
-            document.getElementById('statBalance').textContent = `$${data.account.balance.toFixed(0)}`;
-            document.getElementById('statEquity').textContent = `$${data.account.equity.toFixed(0)}`;
-        }
-        setPnlValue('statDailyPnl', data.daily_pnl);
+    function renderAccount(account) {
+        if (!account) return;
+        document.getElementById('statBalance').textContent = `$${account.balance.toFixed(0)}`;
+        document.getElementById('statEquity').textContent = `$${account.equity.toFixed(0)}`;
+    }
 
+    function renderActivePairs(pairs) {
         const container = document.getElementById('activePairsContainer');
-        const pairs = data.active_pairs || [];
-        if (pairs.length === 0) {
+        if (!pairs || pairs.length === 0) {
             container.innerHTML = '<div class="empty">No active pairs</div>';
             return;
         }
@@ -719,6 +742,12 @@
                 </div>
             </div>
         `).join('');
+    }
+
+    function renderStatus(data) {
+        if (data.account) renderAccount(data.account);
+        setPnlValue('statDailyPnl', data.daily_pnl);
+        renderActivePairs(data.active_pairs || []);
     }
 
     function renderHistory() {

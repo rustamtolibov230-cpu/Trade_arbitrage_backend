@@ -127,10 +127,13 @@ class MT5Client:
             else:  # RETURN
                 filling = mt5.ORDER_FILLING_RETURN
 
-            # Round lot to symbol's volume step
+            # Round lot to symbol's volume step, clamp to broker min/max
             vol_step = info.volume_step
             lot_rounded = round(round(lot / vol_step) * vol_step, 8)
             lot_rounded = max(lot_rounded, info.volume_min)
+            lot_rounded = min(lot_rounded, info.volume_max)
+            if lot_rounded != lot:
+                logger.debug(f"Lot adjusted {symbol}: {lot} → {lot_rounded} (step={vol_step}, min={info.volume_min}, max={info.volume_max})")
 
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -159,7 +162,7 @@ class MT5Client:
         return await _run_in_executor(_send)
 
     async def close_order(self, ticket: int, symbol: str, lot: float, order_type: str) -> bool:
-        """Close a position by ticket."""
+        """Close a position by ticket. Uses actual MT5 position volume to avoid lot mismatch."""
 
         def _close():
             tick = mt5.symbol_info_tick(symbol)
@@ -169,6 +172,17 @@ class MT5Client:
             info = mt5.symbol_info(symbol)
             if info is None:
                 return False
+
+            # Always use the actual position volume from MT5, not the stored lot.
+            # Brokers round lots during order execution — using the stored lot can
+            # cause "invalid volume" or partial-close errors.
+            positions = mt5.positions_get(ticket=ticket)
+            if positions and len(positions) > 0:
+                actual_lot = positions[0].volume
+            else:
+                # Position may already be closed
+                logger.warning(f"Position ticket={ticket} not found, may already be closed")
+                return True
 
             # To close: opposite order type
             close_type = (
@@ -188,7 +202,7 @@ class MT5Client:
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
-                "volume": lot,
+                "volume": actual_lot,
                 "type": close_type,
                 "position": ticket,
                 "price": price,
@@ -205,7 +219,7 @@ class MT5Client:
                 logger.error(f"Close failed ticket={ticket}: {err}")
                 return False
 
-            logger.info(f"Closed ticket={ticket} {symbol} @ {price}")
+            logger.info(f"Closed ticket={ticket} {symbol} {actual_lot}lot @ {price}")
             return True
 
         return await _run_in_executor(_close)
