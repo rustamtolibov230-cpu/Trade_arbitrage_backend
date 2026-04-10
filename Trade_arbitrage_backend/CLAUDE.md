@@ -16,7 +16,7 @@ Pairs trading / statistical arbitrage bot that trades mean-reverting spreads bet
 | Pair | Lots | Filling | Session |
 |------|------|---------|---------|
 | BTCUSD / ETHUSD | 0.04 / 0.80 | FOK | 24/7 |
-| XAUUSD / XAGUSD | 0.01 / 0.10 | IOC | 07-17 UTC |
+| XAUUSD / XAGUSD | 0.01 / 0.01 | IOC | 07-17 UTC |
 
 ## Key Files
 ```

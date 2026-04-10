@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     min_correlation: float = 0.80  # don't trade if correlation drops below
 
     # Scanning
-    scan_interval_seconds: int = 15  # how often to check for signals
+    scan_interval_seconds: int = 3  # how often to check for signals
     timeframe: str = "M1"  # M1 for faster signals (was M5)
     spread_lookback: int = 50  # bars for Z-score (was 100)
 
@@ -78,7 +78,7 @@ PAIRS = [
         leg_a="XAUUSD",
         leg_b="XAGUSD",
         leg_a_lot=0.01,
-        leg_b_lot=0.1,
+        leg_b_lot=0.01,
         zscore_entry=1.0,
         zscore_exit=0.2,        # fallback Z-score exit
         zscore_stop=2.5,        # emergency stop

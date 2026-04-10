@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from config.settings import PAIRS, settings; from src.spread_tracker import SpreadTracker; from src.execution import ExecutionEngine; import server; print\\('OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import server; import src.spread_tracker; print\\('OK'\\)\")",
+      "Bash(python -c \"import server; from src.spread_tracker import SpreadTracker; from src.mt5_client import MT5Client; print\\('OK'\\)\")",
+      "Bash(python -c \"import server; print\\('OK'\\)\")",
+      "Bash(python build_exe.py)",
+      "Bash(tasklist)",
+      "Bash(python -c \"from server import *; print\\('imports OK'\\)\")",
+      "Bash(timeout 10)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(taskkill //F //IM arbitrage_run.exe)",
+      "Bash(python run.py)",
+      "Bash(taskkill //F //PID 10280)"
+    ]
+  }
+}
