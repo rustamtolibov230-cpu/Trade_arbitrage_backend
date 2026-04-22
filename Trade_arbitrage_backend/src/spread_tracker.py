@@ -136,6 +136,11 @@ class SpreadTracker:
         if not self._is_in_session():
             return None  # outside trading session — show data but don't trade
 
+        # Skip if spread already too wide — no room between here and stop_loss,
+        # any entry here is catching a falling knife.
+        if abs(z) >= self.cfg.zscore_entry_max:
+            return None
+
         # The configured lots are already manually calibrated for dollar-neutral
         # exposure (e.g. 0.04 BTC / 0.80 ETH ≈ equal dollar ATR exposure).
         # We use them directly — no additional ATR multiplier.

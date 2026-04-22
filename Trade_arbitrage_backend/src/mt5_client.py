@@ -26,35 +26,81 @@ class MT5Client:
 
     def __init__(self):
         self._connected = False
+        self._last_error: str = ""
+        self._login: int = 0
+        self._server: str = ""
 
-    async def connect(self) -> bool:
-        """Initialize MT5 connection."""
-        if self._connected:
-            return True
+    async def connect(
+        self,
+        login: int | None = None,
+        password: str | None = None,
+        server: str | None = None,
+        path: str | None = None,
+    ) -> bool:
+        """Initialize MT5 connection.
+
+        If credentials are passed, use them (runtime login from dashboard).
+        Otherwise fall back to values from .env / settings.
+        Calling this while already connected will shut down and re-initialize,
+        so the user can switch accounts without restarting the server.
+        """
+        use_login = login if login is not None else settings.mt5_login
+        use_password = password if password is not None else settings.mt5_password
+        use_server = server if server is not None else settings.mt5_server
+        use_path = path if path is not None else settings.mt5_path
 
         def _init():
+            # If already initialized, shut down first so re-login picks up new creds
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
             if not mt5.initialize(
-                path=settings.mt5_path,
-                login=settings.mt5_login,
-                password=settings.mt5_password,
-                server=settings.mt5_server,
+                path=use_path,
+                login=int(use_login) if use_login else 0,
+                password=use_password,
+                server=use_server,
             ):
-                logger.error(f"MT5 init failed: {mt5.last_error()}")
+                err = mt5.last_error()
+                logger.error(f"MT5 init failed: {err}")
+                self._last_error = f"{err}"
                 return False
+
             info = mt5.account_info()
-            if info:
-                logger.info(
-                    f"MT5 connected: {info.login} | Balance: ${info.balance:.2f}"
-                )
+            if info is None:
+                self._last_error = "account_info returned None after init"
+                logger.error(self._last_error)
+                return False
+
+            self._login = info.login
+            self._server = info.server if hasattr(info, "server") else use_server
+            self._last_error = ""
+            logger.info(
+                f"MT5 connected: {info.login} @ {self._server} | Balance: ${info.balance:.2f}"
+            )
             return True
 
         self._connected = await _run_in_executor(_init)
         return self._connected
 
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def status(self) -> dict:
+        return {
+            "connected": self._connected,
+            "login": self._login if self._connected else 0,
+            "server": self._server if self._connected else "",
+            "last_error": self._last_error,
+        }
+
     async def disconnect(self):
         """Shutdown MT5."""
         await _run_in_executor(mt5.shutdown)
         self._connected = False
+        self._login = 0
+        self._server = ""
         logger.info("MT5 disconnected")
 
     async def get_rates(
@@ -103,9 +149,9 @@ class MT5Client:
         """Open a market order. Returns ticket or None."""
 
         def _send():
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                logger.error(f"No tick for {symbol}")
+            # Ensure symbol is visible in Market Watch (silent no-op if already selected)
+            if not mt5.symbol_select(symbol, True):
+                logger.error(f"symbol_select failed for {symbol}: {mt5.last_error()}")
                 return None
 
             info = mt5.symbol_info(symbol)
@@ -113,19 +159,23 @@ class MT5Client:
                 logger.error(f"No symbol info for {symbol}")
                 return None
 
+            if not info.visible:
+                logger.error(f"{symbol} not visible in Market Watch after select")
+                return None
+
+            if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+                logger.error(f"{symbol} trading disabled by broker")
+                return None
+
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None or (tick.bid == 0 and tick.ask == 0):
+                logger.error(f"No tick for {symbol} (bid={getattr(tick,'bid',None)}, ask={getattr(tick,'ask',None)})")
+                return None
+
             price = tick.ask if order_type == "BUY" else tick.bid
             mt5_type = (
                 mt5.ORDER_TYPE_BUY if order_type == "BUY" else mt5.ORDER_TYPE_SELL
             )
-
-            # Auto-detect filling mode from symbol info
-            filling = mt5.ORDER_FILLING_FOK  # default
-            if info.filling_mode & 2:  # supports IOC
-                filling = mt5.ORDER_FILLING_IOC
-            elif info.filling_mode & 1:  # supports FOK
-                filling = mt5.ORDER_FILLING_FOK
-            else:  # RETURN
-                filling = mt5.ORDER_FILLING_RETURN
 
             # Round lot to symbol's volume step, clamp to broker min/max
             vol_step = info.volume_step
@@ -135,29 +185,52 @@ class MT5Client:
             if lot_rounded != lot:
                 logger.debug(f"Lot adjusted {symbol}: {lot} → {lot_rounded} (step={vol_step}, min={info.volume_min}, max={info.volume_max})")
 
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": lot_rounded,
-                "type": mt5_type,
-                "price": price,
-                "deviation": 20,
-                "magic": 777777,
-                "comment": comment,
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": filling,
-            }
+            # Build filling-mode fallback list based on what the symbol advertises.
+            # Some brokers report the supported mask incorrectly, so we try all
+            # advertised modes plus RETURN as a last resort.
+            filling_candidates = []
+            if info.filling_mode & 2:
+                filling_candidates.append(mt5.ORDER_FILLING_IOC)
+            if info.filling_mode & 1:
+                filling_candidates.append(mt5.ORDER_FILLING_FOK)
+            for mode in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
+                if mode not in filling_candidates:
+                    filling_candidates.append(mode)
 
-            result = mt5.order_send(request)
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-                err = result.comment if result else "None"
-                logger.error(f"Order failed {symbol} {order_type}: {err}")
-                return None
+            last_err = ""
+            last_retcode = 0
+            for filling in filling_candidates:
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": symbol,
+                    "volume": lot_rounded,
+                    "type": mt5_type,
+                    "price": price,
+                    "deviation": 20,
+                    "magic": 777777,
+                    "comment": comment,
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": filling,
+                }
+                result = mt5.order_send(request)
+                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(
+                        f"Opened {order_type} {lot_rounded} {symbol} @ {price} | ticket={result.order} | filling={filling}"
+                    )
+                    return result.order
 
-            logger.info(
-                f"Opened {order_type} {lot} {symbol} @ {price} | ticket={result.order}"
+                last_retcode = result.retcode if result else 0
+                last_err = result.comment if result else str(mt5.last_error())
+                # Only retry a different filling mode for invalid-fill errors
+                if last_retcode != 10030:  # TRADE_RETCODE_INVALID_FILL
+                    break
+
+            logger.error(
+                f"Order failed {symbol} {order_type} {lot_rounded}lot: "
+                f"retcode={last_retcode} comment='{last_err}' "
+                f"supported_filling={info.filling_mode} min={info.volume_min} step={info.volume_step}"
             )
-            return result.order
+            return None
 
         return await _run_in_executor(_send)
 
@@ -165,12 +238,14 @@ class MT5Client:
         """Close a position by ticket. Uses actual MT5 position volume to avoid lot mismatch."""
 
         def _close():
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                return False
+            mt5.symbol_select(symbol, True)
 
             info = mt5.symbol_info(symbol)
             if info is None:
+                return False
+
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
                 return False
 
             # Always use the actual position volume from MT5, not the stored lot.
@@ -190,37 +265,43 @@ class MT5Client:
             )
             price = tick.bid if order_type == "BUY" else tick.ask
 
-            # Auto-detect filling mode
-            filling = mt5.ORDER_FILLING_FOK
+            filling_candidates = []
             if info.filling_mode & 2:
-                filling = mt5.ORDER_FILLING_IOC
-            elif info.filling_mode & 1:
-                filling = mt5.ORDER_FILLING_FOK
-            else:
-                filling = mt5.ORDER_FILLING_RETURN
+                filling_candidates.append(mt5.ORDER_FILLING_IOC)
+            if info.filling_mode & 1:
+                filling_candidates.append(mt5.ORDER_FILLING_FOK)
+            for mode in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
+                if mode not in filling_candidates:
+                    filling_candidates.append(mode)
 
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": actual_lot,
-                "type": close_type,
-                "position": ticket,
-                "price": price,
-                "deviation": 20,
-                "magic": 777777,
-                "comment": "arb_close",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": filling,
-            }
+            last_err = ""
+            last_retcode = 0
+            for filling in filling_candidates:
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": symbol,
+                    "volume": actual_lot,
+                    "type": close_type,
+                    "position": ticket,
+                    "price": price,
+                    "deviation": 20,
+                    "magic": 777777,
+                    "comment": "arb_close",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": filling,
+                }
+                result = mt5.order_send(request)
+                if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    logger.info(f"Closed ticket={ticket} {symbol} {actual_lot}lot @ {price} | filling={filling}")
+                    return True
 
-            result = mt5.order_send(request)
-            if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-                err = result.comment if result else "None"
-                logger.error(f"Close failed ticket={ticket}: {err}")
-                return False
+                last_retcode = result.retcode if result else 0
+                last_err = result.comment if result else str(mt5.last_error())
+                if last_retcode != 10030:  # TRADE_RETCODE_INVALID_FILL
+                    break
 
-            logger.info(f"Closed ticket={ticket} {symbol} {actual_lot}lot @ {price}")
-            return True
+            logger.error(f"Close failed ticket={ticket} {symbol}: retcode={last_retcode} comment='{last_err}'")
+            return False
 
         return await _run_in_executor(_close)
 

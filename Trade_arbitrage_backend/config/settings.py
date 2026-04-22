@@ -15,6 +15,7 @@ class PairConfig:
         leg_a_lot: float,
         leg_b_lot: float,
         zscore_entry: float = 2.0,
+        zscore_entry_max: float = 2.0,
         zscore_exit: float = 0.5,
         zscore_stop: float = 3.5,
         lookback: int = 100,
@@ -27,6 +28,8 @@ class PairConfig:
         self.leg_a_lot = leg_a_lot
         self.leg_b_lot = leg_b_lot
         self.zscore_entry = zscore_entry
+        # Don't enter if |Z| is already this far — too close to stop, no room to work
+        self.zscore_entry_max = zscore_entry_max
         self.zscore_exit = zscore_exit
         self.zscore_stop = zscore_stop
         self.lookback = lookback  # bars for spread mean/std
@@ -54,6 +57,11 @@ class Settings(BaseSettings):
     timeframe: str = "M1"  # M1 for faster signals (was M5)
     spread_lookback: int = 50  # bars for Z-score (was 100)
 
+    # After a pair closes, wait this long before reopening it. Prevents the
+    # "stop out → immediate reopen at same wide Z → stop out again" loop that
+    # bleeds spread on every round trip.
+    cooldown_seconds: int = 300
+
     # Pairs — configured in code, not env
     model_config = {"env_file": ".env", "extra": "ignore"}
 
@@ -67,6 +75,7 @@ PAIRS = [
         leg_a_lot=0.04,
         leg_b_lot=0.8,
         zscore_entry=1.0,       # enter when spread is 1 std dev wide
+        zscore_entry_max=1.8,   # skip entry if Z already too close to stop
         zscore_exit=0.2,        # fallback: close if Z reverts but profit not hit
         zscore_stop=2.5,        # emergency stop if spread keeps widening
         lookback=50,
@@ -80,6 +89,7 @@ PAIRS = [
         leg_a_lot=0.01,
         leg_b_lot=0.01,
         zscore_entry=1.0,
+        zscore_entry_max=1.8,
         zscore_exit=0.2,        # fallback Z-score exit
         zscore_stop=2.5,        # emergency stop
         lookback=50,

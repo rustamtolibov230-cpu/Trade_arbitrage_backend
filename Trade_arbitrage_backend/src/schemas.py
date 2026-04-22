@@ -1,8 +1,12 @@
 """Data models for pairs trading."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -18,7 +22,7 @@ class SpreadState:
     zscore: float
     correlation: float
     hedge_ratio: float  # ATR-adjusted lot ratio
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=_utcnow)
 
 
 @dataclass
@@ -51,7 +55,7 @@ class ActivePair:
     leg_a_lot: float
     leg_b_lot: float
     entry_zscore: float
-    entry_time: datetime = field(default_factory=datetime.utcnow)
+    entry_time: datetime = field(default_factory=_utcnow)
     max_profit: float = 0.0
     min_profit: float = 0.0
 

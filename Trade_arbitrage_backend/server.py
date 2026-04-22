@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from pydantic import BaseModel
 
 from config.settings import settings, PAIRS
 from src.mt5_client import MT5Client
@@ -167,6 +168,70 @@ async def api_close_all():
     return {"closed": len(results)}
 
 
+# --- MT5 login (runtime credentials from dashboard) ---
+
+class MT5LoginRequest(BaseModel):
+    login: int
+    password: str
+    server: str
+    path: str | None = None
+
+
+@app.get("/api/mt5-status")
+async def api_mt5_status():
+    """Return whether MT5 is connected and which account."""
+    return mt5_client.status()
+
+
+@app.post("/api/mt5-login")
+async def api_mt5_login(req: MT5LoginRequest):
+    """Connect (or re-connect) MT5 with runtime credentials from the dashboard.
+
+    Stops the bot and closes all pairs before switching accounts to prevent
+    orphaned positions against the old login.
+    """
+    global _bot_running
+
+    # Stop bot + close pairs before switching accounts
+    if _bot_running:
+        _bot_running = False
+        await broadcast({"type": "bot_state", "running": False})
+    if execution.active_pairs:
+        logger.warning("Closing all pairs before MT5 re-login")
+        await execution.close_all("mt5_relogin")
+
+    ok = await mt5_client.connect(
+        login=req.login,
+        password=req.password,
+        server=req.server,
+        path=req.path,
+    )
+    status = mt5_client.status()
+
+    if ok:
+        account = await mt5_client.get_account_info()
+        if account:
+            risk_mgr.set_start_balance(account["balance"])
+        await broadcast({"type": "mt5_status", **status})
+        return {"status": "connected", **status}
+
+    return {"status": "failed", **status}
+
+
+@app.post("/api/mt5-logout")
+async def api_mt5_logout():
+    """Disconnect MT5 and stop the bot."""
+    global _bot_running
+    if _bot_running:
+        _bot_running = False
+        await broadcast({"type": "bot_state", "running": False})
+    if execution.active_pairs:
+        await execution.close_all("mt5_logout")
+    await mt5_client.disconnect()
+    await broadcast({"type": "mt5_status", "connected": False, "login": 0, "server": "", "last_error": ""})
+    return {"status": "disconnected"}
+
+
 # --- Bot loop (runs as background task) ---
 _bot_running = False
 _bot_task = None
@@ -178,6 +243,8 @@ async def api_start():
     global _bot_task, _bot_running
     if _bot_running:
         return {"status": "already_running"}
+    if not mt5_client.is_connected():
+        return {"status": "error", "error": "MT5 not connected — log in first"}
     _bot_running = True  # set BEFORE creating task to prevent double-start race
     _bot_task = asyncio.create_task(bot_loop())
     await broadcast({"type": "bot_state", "running": True})
@@ -243,6 +310,15 @@ async def bot_loop():
 
                 # Risk check for entries
                 if signal_obj.action.startswith("OPEN"):
+                    cooldown_left = execution.cooldown_remaining(
+                        state.pair_name, settings.cooldown_seconds
+                    )
+                    if cooldown_left > 0:
+                        logger.info(
+                            f"  COOLDOWN {tracker.pair_name}: {cooldown_left:.0f}s left"
+                        )
+                        continue
+
                     ok, reason = risk_mgr.can_open_pair(state)
                     if not ok:
                         logger.warning(f"  BLOCKED {tracker.pair_name}: {reason}")
@@ -273,16 +349,19 @@ async def bot_loop():
 
 @app.on_event("startup")
 async def on_startup():
-    """Connect MT5 — bot waits for Start button."""
-    connected = await mt5_client.connect()
-    if not connected:
-        logger.error("MT5 connection failed!")
+    """Try MT5 auto-connect from .env; if creds missing/invalid, user logs in from dashboard."""
+    if settings.mt5_login and settings.mt5_password and settings.mt5_server:
+        connected = await mt5_client.connect()
+        if connected:
+            account = await mt5_client.get_account_info()
+            if account:
+                risk_mgr.set_start_balance(account["balance"])
+        else:
+            logger.warning("Auto-connect failed — waiting for dashboard login")
+    else:
+        logger.info("No MT5 creds in .env — waiting for dashboard login")
 
-    account = await mt5_client.get_account_info()
-    if account:
-        risk_mgr.set_start_balance(account["balance"])
-
-    # Always-on tasks — run even when bot is stopped
+    # Always-on tasks — run even when MT5 disconnected / bot stopped
     asyncio.create_task(display_loop())
     asyncio.create_task(trade_monitor_task())
 
@@ -486,6 +565,7 @@ async def display_loop():
                     "active_pairs": active,
                     "history": history,
                     "bot_running": _bot_running,
+                    "mt5": mt5_client.status(),
                     "cycle": _cycle,
                 })
         except Exception as e:

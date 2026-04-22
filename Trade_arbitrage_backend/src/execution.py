@@ -1,12 +1,17 @@
 """Execution engine — opens and closes hedged pairs."""
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Optional, List
 
 from loguru import logger
 
 from src.mt5_client import MT5Client
 from src.schemas import PairSignal, ActivePair, TradeResult
+
+
+HISTORY_FILE = Path("data") / "trade_history.json"
 
 
 class ExecutionEngine:
@@ -16,6 +21,68 @@ class ExecutionEngine:
         self.mt5 = mt5
         self.active_pairs: Dict[str, ActivePair] = {}
         self.trade_history: List[TradeResult] = []
+        self._last_close_time: Dict[str, datetime] = {}
+        self._load_history()
+        # Seed cooldown from persisted history so a restart doesn't bypass it
+        for t in self.trade_history:
+            prev = self._last_close_time.get(t.pair_name)
+            if prev is None or t.exit_time > prev:
+                self._last_close_time[t.pair_name] = t.exit_time
+
+    def cooldown_remaining(self, pair_name: str, cooldown_seconds: int) -> float:
+        """Seconds left before this pair can be reopened. 0 if ready."""
+        last = self._last_close_time.get(pair_name)
+        if last is None or cooldown_seconds <= 0:
+            return 0.0
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        return max(0.0, cooldown_seconds - elapsed)
+
+    def _load_history(self) -> None:
+        if not HISTORY_FILE.exists():
+            return
+        try:
+            raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.error(f"Failed to read {HISTORY_FILE}: {e} — starting with empty history")
+            return
+
+        for item in raw:
+            try:
+                self.trade_history.append(TradeResult(
+                    pair_name=item["pair_name"],
+                    profit=float(item["profit"]),
+                    hold_minutes=float(item["hold_minutes"]),
+                    entry_zscore=float(item["entry_zscore"]),
+                    exit_zscore=float(item["exit_zscore"]),
+                    entry_time=datetime.fromisoformat(item["entry_time"]),
+                    exit_time=datetime.fromisoformat(item["exit_time"]),
+                    reason=item["reason"],
+                ))
+            except Exception as e:
+                logger.warning(f"Skipping bad trade record: {e} | {item}")
+        logger.info(f"Loaded {len(self.trade_history)} historical trades from {HISTORY_FILE}")
+
+    def _save_history(self) -> None:
+        try:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = [
+                {
+                    "pair_name": t.pair_name,
+                    "profit": t.profit,
+                    "hold_minutes": t.hold_minutes,
+                    "entry_zscore": t.entry_zscore,
+                    "exit_zscore": t.exit_zscore,
+                    "entry_time": t.entry_time.isoformat(),
+                    "exit_time": t.exit_time.isoformat(),
+                    "reason": t.reason,
+                }
+                for t in self.trade_history
+            ]
+            tmp = HISTORY_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(HISTORY_FILE)
+        except Exception as e:
+            logger.error(f"Failed to save trade history: {e}")
 
     def has_open_pair(self, pair_name: str) -> bool:
         return pair_name in self.active_pairs
@@ -66,10 +133,16 @@ class ExecutionEngine:
         )
         if ticket_b is None:
             # Leg A opened but leg B failed — close leg A to avoid unhedged exposure
-            logger.error(f"Failed to open leg B: {signal.leg_b}, closing leg A")
-            await self.mt5.close_order(
+            logger.error(
+                f"Failed to open leg B ({signal.leg_b}) — rolling back leg A ({signal.leg_a} ticket={ticket_a})"
+            )
+            closed = await self.mt5.close_order(
                 ticket_a, signal.leg_a, signal.leg_a_lot, signal.leg_a_side
             )
+            if not closed:
+                logger.error(
+                    f"!!! ORPHAN POSITION !!! rollback close of {signal.leg_a} ticket={ticket_a} FAILED — MANUAL CHECK NEEDED"
+                )
             return False
 
         # Track the pair
@@ -138,6 +211,8 @@ class ExecutionEngine:
             reason=reason_map.get(signal.action, signal.action),
         )
         self.trade_history.append(result)
+        self._last_close_time[signal.pair_name] = now
+        self._save_history()
 
         # Remove from active
         del self.active_pairs[signal.pair_name]
