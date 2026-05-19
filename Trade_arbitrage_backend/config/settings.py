@@ -92,10 +92,18 @@ class Settings(BaseSettings):
 
 # profit_target must exceed round-trip cost (spread + commission, both legs).
 # Per src/backtest/cost_model.py IC_MARKETS_RAW at the lots below:
-#   BTC/ETH  0.04 / 0.80  → cost ≈ $7.16  (ETH commission alone is $5.60)
-#   XAU/XAG  0.01 / 0.01  → cost ≈ $1.26  (XAG spread alone is $1.00)
-# Targets set to 2× cost for slippage headroom. If you change lots, recompute
-# with round_trip_cost_for_pair() and update — task #2 will enforce this at startup.
+#   BTC/ETH       0.04 / 0.80  → cost ≈ $7.16   (ETH commission alone is $5.60)
+#   XAU/XAG       0.01 / 0.01  → cost ≈ $1.26   (XAG spread alone is $1.00)
+#   USOIL/UKOIL   0.01 / 0.01  → cost ≈ $0.74
+#   NAS100/SPX500 0.10 / 0.10  → cost ≈ $0.27   (no commission on indices)
+#   AUDUSD/NZDUSD 0.01 / 0.01  → cost ≈ $0.49
+# Targets set to ~2× cost for slippage headroom. If you change lots, recompute
+# with round_trip_cost_for_pair() and update — task #2 enforces at startup.
+#
+# IMPORTANT: cost model uses IC Markets defaults. BlackBull spreads / contract
+# sizes may differ — verify in MT5 Market Watch (right-click symbol → Specs).
+# Symbol names may also differ across brokers (e.g. NAS100 vs US100, USOIL vs
+# XTIUSD). Rename `leg_a` / `leg_b` below to match what your broker uses.
 
 PAIRS = [
     PairConfig(
@@ -123,9 +131,60 @@ PAIRS = [
         zscore_stop=2.5,        # emergency stop
         lookback=50,
         session_hours=None,
-        weekdays_only=True,  # 24/5 — metals closed on weekends
+        weekdays_only=True,     # 24/5 — metals closed on weekends
         max_hold_minutes=30,
-        profit_target=2.5,      # 2× round-trip cost ($1.26) — see header comment
+        profit_target=2.5,      # 2× round-trip cost ($1.26)
+    ),
+    # --- New stat-arb candidates --------------------------------------------
+    # WTI vs Brent crude. Physically related (oil supply/demand), strong
+    # cointegration historically. Spread = quality + logistics premium.
+    PairConfig(
+        leg_a="USOIL",
+        leg_b="UKOIL",
+        leg_a_lot=0.01,
+        leg_b_lot=0.01,
+        zscore_entry=1.0,
+        zscore_entry_max=1.8,
+        zscore_exit=0.2,
+        zscore_stop=2.5,
+        lookback=50,
+        session_hours=None,
+        weekdays_only=True,     # oil markets closed on weekends
+        max_hold_minutes=30,
+        profit_target=1.50,     # 2× round-trip cost ($0.74)
+    ),
+    # Nasdaq 100 vs S&P 500. Cleanest index cointegration on retail brokers.
+    # Trades only during US cash hours (13:30-20:00 UTC ≈ 13-21 UTC window).
+    PairConfig(
+        leg_a="NAS100",
+        leg_b="SPX500",
+        leg_a_lot=0.1,
+        leg_b_lot=0.1,
+        zscore_entry=1.0,
+        zscore_entry_max=1.8,
+        zscore_exit=0.2,
+        zscore_stop=2.5,
+        lookback=50,
+        session_hours=[(13, 21)],   # US session UTC
+        weekdays_only=True,
+        max_hold_minutes=30,
+        profit_target=0.75,         # ~3× round-trip cost ($0.27)
+    ),
+    # AUDUSD vs NZDUSD. Highest-correlation FX pair, both Australasian risk.
+    PairConfig(
+        leg_a="AUDUSD",
+        leg_b="NZDUSD",
+        leg_a_lot=0.01,
+        leg_b_lot=0.01,
+        zscore_entry=1.0,
+        zscore_entry_max=1.8,
+        zscore_exit=0.2,
+        zscore_stop=2.5,
+        lookback=50,
+        session_hours=None,         # FX traded 24/5
+        weekdays_only=True,
+        max_hold_minutes=30,
+        profit_target=1.00,         # ~2× round-trip cost ($0.49)
     ),
 ]
 

@@ -122,6 +122,63 @@ IC_MARKETS_RAW = BrokerCostModel(
             min_lot=0.01,
             lot_step=0.01,
         ),
+        # --- Energy ---
+        # WTI / Brent crude on BlackBull: usually 1 lot = 1000 barrels.
+        # If your broker uses 100, halve contract_size and double targets.
+        "USOIL": SymbolCost(
+            symbol="USOIL",
+            contract_size=1000.0,
+            typical_spread=0.03,         # ~3 cents per barrel raw spread
+            commission_per_lot=3.50,
+            min_lot=0.01,
+            lot_step=0.01,
+        ),
+        "UKOIL": SymbolCost(
+            symbol="UKOIL",
+            contract_size=1000.0,
+            typical_spread=0.03,
+            commission_per_lot=3.50,
+            min_lot=0.01,
+            lot_step=0.01,
+        ),
+        # --- Indices ---
+        # 1 lot ~ $1 per index point on most retail brokers (BlackBull included).
+        # Spreads in *index points*.
+        "NAS100": SymbolCost(
+            symbol="NAS100",
+            contract_size=1.0,
+            typical_spread=2.0,          # 2 points typical
+            commission_per_lot=0.0,      # most CFD indices spread-only
+            min_lot=0.1,
+            lot_step=0.1,
+        ),
+        "SPX500": SymbolCost(
+            symbol="SPX500",
+            contract_size=1.0,
+            typical_spread=0.7,          # 0.7 points typical
+            commission_per_lot=0.0,
+            min_lot=0.1,
+            lot_step=0.1,
+        ),
+        # --- FX ---
+        # Standard lot = 100,000 base currency. Spread in price units
+        # (price digits = 0.00001 for 5-decimal pairs).
+        "AUDUSD": SymbolCost(
+            symbol="AUDUSD",
+            contract_size=100000.0,
+            typical_spread=0.00015,      # ~1.5 pips raw
+            commission_per_lot=3.50,
+            min_lot=0.01,
+            lot_step=0.01,
+        ),
+        "NZDUSD": SymbolCost(
+            symbol="NZDUSD",
+            contract_size=100000.0,
+            typical_spread=0.00020,      # ~2 pips raw
+            commission_per_lot=3.50,
+            min_lot=0.01,
+            lot_step=0.01,
+        ),
     },
 )
 
