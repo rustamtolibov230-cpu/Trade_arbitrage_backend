@@ -21,6 +21,13 @@ from src.mt5_client import MT5Client
 from src.spread_tracker import SpreadTracker
 from src.execution import ExecutionEngine
 from src.risk_manager import RiskManager
+from src.cointegration import CointegrationMonitor
+from src.backtest.cost_model import (
+    IC_MARKETS_RAW,
+    validate_profit_targets,
+    format_cost_check_line,
+    check_trade_viability,
+)
 
 # --- Logging setup ---
 logger.remove()
@@ -43,15 +50,34 @@ class ArbitrageBot:
     def __init__(self):
         self.mt5 = MT5Client()
         self.execution = ExecutionEngine(self.mt5)
-        self.risk = RiskManager(self.execution)
+        self.coint_monitor = CointegrationMonitor(PAIRS, self.mt5)
+        self.risk = RiskManager(self.execution, coint=self.coint_monitor)
         self.trackers = [SpreadTracker(cfg, self.mt5) for cfg in PAIRS]
         self._running = False
+        self._coint_task: asyncio.Task | None = None
 
     async def start(self):
         """Connect to MT5 and start the main loop."""
         logger.info("=" * 60)
         logger.info("  TRADE ARBITRAGE BOT — Starting")
         logger.info("=" * 60)
+
+        # Profit-target vs round-trip cost sanity gate. Refuse to start if
+        # any pair would lose money on every closed trade.
+        sf = settings.profit_target_safety_factor
+        all_ok, rows = validate_profit_targets(PAIRS, IC_MARKETS_RAW, safety_factor=sf)
+        for row in rows:
+            line = format_cost_check_line(row, sf)
+            if row["ok"] and not row.get("error"):
+                logger.info(line)
+            else:
+                logger.error(line)
+        if not all_ok:
+            logger.error(
+                "Aborting — profit-target sanity check failed. "
+                "Fix profit_target or lots in config/settings.py."
+            )
+            return
 
         # Connect
         if not await self.mt5.connect():
@@ -76,9 +102,25 @@ class ArbitrageBot:
         logger.info(f"Scan interval: {settings.scan_interval_seconds}s")
         logger.info(f"Max open pairs: {settings.max_open_pairs}")
         logger.info(f"Daily loss limit: ${settings.max_daily_loss}")
+        if settings.require_cointegration:
+            logger.info(
+                f"Cointegration filter: ON "
+                f"(p<={settings.coint_p_threshold}, "
+                f"lookback={settings.coint_lookback_bars} {settings.coint_timeframe} bars, "
+                f"recheck={settings.coint_recheck_seconds}s, "
+                f"half-life∈[{settings.coint_min_half_life},{settings.coint_max_half_life}])"
+            )
+        else:
+            logger.warning("Cointegration filter: OFF")
         logger.info("-" * 60)
 
         self._running = True
+
+        # Kick off background cointegration recheck loop
+        self._coint_task = asyncio.create_task(
+            self.coint_monitor.run_periodic(lambda: not self._running)
+        )
+
         await self._main_loop()
 
     async def _main_loop(self):
@@ -92,9 +134,12 @@ class ArbitrageBot:
 
                 # --- 1. Compute spreads for all pairs ---
                 for tracker in self.trackers:
+                    pair_name = f"{tracker.cfg.leg_a}/{tracker.cfg.leg_b}"
+                    coint_state = self.coint_monitor.get_state(pair_name)
                     state = await tracker.compute_spread(
                         timeframe=settings.timeframe,
                         lookback=settings.spread_lookback,
+                        coint_state=coint_state,
                     )
 
                     if state is None:
@@ -114,7 +159,11 @@ class ArbitrageBot:
                     )
 
                     # --- 2. Generate signal (Z-score stop, entries) ---
-                    signal_obj = tracker.generate_signal(state, is_open)
+                    # Re-use the cointegration state we already looked up so
+                    # spread Z-score and hedge sizing stay consistent.
+                    signal_obj = tracker.generate_signal(
+                        state, is_open, coint_state, IC_MARKETS_RAW
+                    )
 
                     if signal_obj is None:
                         continue
@@ -125,6 +174,25 @@ class ArbitrageBot:
                         if not ok:
                             logger.warning(
                                 f"Risk blocked {state.pair_name}: {reason}"
+                            )
+                            continue
+
+                        # Runtime cost check — beta sizing can change leg_b
+                        # enough to push the trade below the safety factor.
+                        cost_ok, total_cost, ratio = check_trade_viability(
+                            IC_MARKETS_RAW,
+                            signal_obj.leg_a,
+                            signal_obj.leg_b,
+                            signal_obj.leg_a_lot,
+                            signal_obj.leg_b_lot,
+                            tracker.cfg.profit_target,
+                            settings.profit_target_safety_factor,
+                        )
+                        if not cost_ok:
+                            logger.warning(
+                                f"Cost blocked {state.pair_name}: cost=${total_cost:.2f}, "
+                                f"target=${tracker.cfg.profit_target:.2f}, "
+                                f"ratio={ratio:.2f}x"
                             )
                             continue
 
@@ -234,6 +302,14 @@ class ArbitrageBot:
         """Graceful shutdown."""
         logger.info("Shutting down...")
         self._running = False
+
+        # Cancel background cointegration recheck
+        if self._coint_task is not None and not self._coint_task.done():
+            self._coint_task.cancel()
+            try:
+                await self._coint_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Close all active pairs
         if self.execution.active_pairs:

@@ -6,6 +6,7 @@ from typing import Optional
 from loguru import logger
 
 from config.settings import settings
+from src.cointegration import CointegrationMonitor
 from src.execution import ExecutionEngine
 from src.schemas import SpreadState
 
@@ -13,8 +14,13 @@ from src.schemas import SpreadState
 class RiskManager:
     """Validates pair trades against risk limits."""
 
-    def __init__(self, execution: ExecutionEngine):
+    def __init__(
+        self,
+        execution: ExecutionEngine,
+        coint: Optional[CointegrationMonitor] = None,
+    ):
         self.execution = execution
+        self.coint = coint
         self._start_balance: Optional[float] = None
 
     def set_start_balance(self, balance: float):
@@ -39,6 +45,14 @@ class RiskManager:
                 f"Correlation too low: {spread_state.correlation:.3f} "
                 f"< {settings.min_correlation}"
             )
+
+        # Cointegration filter — correlation alone doesn't guarantee the
+        # spread is mean-reverting. Block entries on pairs whose spread isn't
+        # stationary (or whose half-life is outside the tradable band).
+        if self.coint is not None:
+            ok, reason = self.coint.is_tradeable(spread_state.pair_name)
+            if not ok:
+                return False, f"Cointegration: {reason}"
 
         # Daily loss limit
         daily_pnl = self.execution.get_daily_pnl()

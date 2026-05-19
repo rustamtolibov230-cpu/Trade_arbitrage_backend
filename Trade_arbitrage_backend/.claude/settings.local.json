@@ -13,7 +13,26 @@
       "Bash(taskkill //F //IM python.exe)",
       "Bash(taskkill //F //IM arbitrage_run.exe)",
       "Bash(python run.py)",
-      "Bash(taskkill //F //PID 10280)"
+      "Bash(taskkill //F //PID 10280)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('run.py'\\).read\\(\\)\\); ast.parse\\(open\\('build_exe.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(curl -s http://127.0.0.1:8050/api/mt5-status)",
+      "Bash(curl -s -X POST http://127.0.0.1:8050/api/start)",
+      "Bash(curl -s -X POST -H \"Content-Type: application/json\" -d '{\"login\":1,\"password\":\"wrong\",\"server\":\"Nonexistent-Demo\"}' http://127.0.0.1:8050/api/mt5-login)",
+      "Bash(curl -s -X POST http://127.0.0.1:8050/api/stop)",
+      "Bash(curl -s -X POST http://127.0.0.1:8050/api/mt5-logout)",
+      "Bash(powershell -Command \"gh --version\")",
+      "Bash(git config *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(winget install *)",
+      "Read(//c/Program Files/GitHub CLI//**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" --version)",
+      "Bash(export PATH=\"/c/Program Files/GitHub CLI:$PATH\")",
+      "Bash(gh auth *)",
+      "Bash(python *)"
     ]
   }
 }

@@ -1,0 +1,35 @@
+Blockers — must fix before any live run
+
+  1. Fix XAU/XAG profit target vs cost — $1 target on a $1.26 round-trip = guaranteed loss
+  2. Add startup sanity check — refuse to start any pair where profit_target < 1.5 × round_trip_cost
+  3. Add MT5 reconnect logic — your last live session died from one IPC timeout and never recovered
+
+  Correctness — strategy math is currently inconsistent
+
+  4. Use OLS beta for hedge sizing — you compute it in cointegration, then ignore it
+  5. Unify spread definition — cointegration filter uses residual, signal uses ratio (two different spreads)
+  6. Recalibrate BTC/ETH lots — claim of dollar-neutrality is off by ~20%
+  7. Match Z-score timeframe and lookback to half-life — M1 × 50 bars can't capture a 100-bar half-life
+
+  Operational fixes
+
+  8. Lower or remove min_correlation — 0.80 is unrealistic short-window; cointegration is the better gate
+  9. Health-check + dashboard alert on data-feed failures — rate-limit warnings and surface DEGRADED state
+
+  Proving the edge (this is the highest-value missing work)
+
+  10. Build a backtest runner — cost model + data loader exist, no runner wires them together
+  11. Add swap/overnight financing to cost model
+  12. Add slippage model with sensitivity test (0×, 1×, 2× typical)
+  13. Walk-forward / out-of-sample split for honest parameter evaluation
+
+  ---
+  Recommended order:
+  - Start with #1, #2, #3 today (blockers — small code, big impact)
+  - Then #9 (build the backtest runner) — until you do this, you don't know if the strategy has an edge at all.
+  Everything downstream depends on this answer.
+  - After backtest results exist, decide whether the math fixes (#4, #5) are worth doing or whether to pivot. There's no
+   point making the signal math more correct if the strategy doesn't have edge after costs in the first place.
+
+  Want me to start with #1+#2+#3 as a single small PR? They're all small, related, and would unblock running the bot at
+  all.

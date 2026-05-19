@@ -24,11 +24,30 @@ async def _run_in_executor(func, *args):
 class MT5Client:
     """Async wrapper around MetaTrader5 Python API."""
 
+    # Auto-reconnect tuning. After this many consecutive fetch failures we
+    # mark the connection dead and start the reconnect task.
+    _FAILURE_THRESHOLD = 3
+    # Exponential backoff between reconnect attempts (seconds). After the
+    # last entry, attempts continue at that interval indefinitely.
+    _RECONNECT_BACKOFFS = (5.0, 15.0, 60.0, 300.0)
+
     def __init__(self):
         self._connected = False
         self._last_error: str = ""
         self._login: int = 0
         self._server: str = ""
+
+        # Credentials from the most recent successful connect — used by the
+        # auto-reconnect task. Cleared by an explicit disconnect() so a
+        # user-initiated logout doesn't bounce back up.
+        self._cached_login: int | None = None
+        self._cached_password: str | None = None
+        self._cached_server: str | None = None
+        self._cached_path: str | None = None
+
+        # Auto-reconnect state.
+        self._consecutive_failures = 0
+        self._reconnect_task: asyncio.Task | None = None
 
     async def connect(
         self,
@@ -82,10 +101,20 @@ class MT5Client:
             return True
 
         self._connected = await _run_in_executor(_init)
+        if self._connected:
+            # Cache creds for auto-reconnect; reset failure counter.
+            self._cached_login = use_login
+            self._cached_password = use_password
+            self._cached_server = use_server
+            self._cached_path = use_path
+            self._consecutive_failures = 0
         return self._connected
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def is_reconnecting(self) -> bool:
+        return self._reconnect_task is not None and not self._reconnect_task.done()
 
     def status(self) -> dict:
         return {
@@ -93,10 +122,105 @@ class MT5Client:
             "login": self._login if self._connected else 0,
             "server": self._server if self._connected else "",
             "last_error": self._last_error,
+            "reconnecting": self.is_reconnecting(),
+            "consecutive_failures": self._consecutive_failures,
         }
 
+    # --- Auto-reconnect on silent failure ----------------------------------
+    # The pattern: every fetch call notes success or failure. After
+    # _FAILURE_THRESHOLD consecutive failures we mark the connection dead and
+    # kick off a single background reconnect task with exponential backoff.
+    # An explicit disconnect() or successful manual login cancels it.
+
+    def _note_failure(self) -> None:
+        """Called by fetch wrappers when an operation returns no data."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._FAILURE_THRESHOLD:
+            if self._connected:
+                logger.error(
+                    f"MT5 declared dead after {self._consecutive_failures} "
+                    f"consecutive failures — starting auto-reconnect"
+                )
+                self._connected = False
+            self._ensure_reconnect_task()
+
+    def _note_success(self) -> None:
+        """Called by fetch wrappers when an operation returns data."""
+        if self._consecutive_failures:
+            self._consecutive_failures = 0
+
+    def _ensure_reconnect_task(self) -> None:
+        """Spawn the reconnect task if one isn't already running."""
+        if self._cached_login is None or self._cached_password is None:
+            # No cached creds (never logged in, or explicit logout) — caller
+            # must reconnect manually via the dashboard.
+            return
+        if self.is_reconnecting():
+            return
+        try:
+            self._reconnect_task = asyncio.get_running_loop().create_task(
+                self._reconnect_loop()
+            )
+        except RuntimeError:
+            # No running loop — nothing we can do here, will retry on next failure
+            pass
+
+    async def _reconnect_loop(self) -> None:
+        """Try to reconnect using cached creds, with exponential backoff."""
+        attempt = 0
+        while True:
+            delay = self._RECONNECT_BACKOFFS[
+                min(attempt, len(self._RECONNECT_BACKOFFS) - 1)
+            ]
+            attempt += 1
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+
+            # Creds may have been cleared by disconnect() while we were sleeping.
+            if self._cached_login is None or self._cached_password is None:
+                return
+
+            logger.warning(
+                f"MT5 reconnect attempt {attempt} (waited {delay:.0f}s)..."
+            )
+            try:
+                ok = await self.connect(
+                    login=self._cached_login,
+                    password=self._cached_password,
+                    server=self._cached_server,
+                    path=self._cached_path,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"MT5 reconnect raised: {e}")
+                ok = False
+
+            if ok:
+                logger.info(f"MT5 reconnected on attempt {attempt}")
+                return
+
     async def disconnect(self):
-        """Shutdown MT5."""
+        """Shutdown MT5 and cancel any in-flight auto-reconnect."""
+        # Cancel reconnect first so it can't race the shutdown.
+        if self.is_reconnecting():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reconnect_task = None
+
+        # Clear cached creds so a future fetch failure doesn't trigger
+        # auto-reconnect against a logged-out account.
+        self._cached_login = None
+        self._cached_password = None
+        self._cached_server = None
+        self._cached_path = None
+        self._consecutive_failures = 0
+
         await _run_in_executor(mt5.shutdown)
         self._connected = False
         self._login = 0
@@ -126,7 +250,12 @@ class MT5Client:
             df["time"] = pd.to_datetime(df["time"], unit="s")
             return df
 
-        return await _run_in_executor(_fetch)
+        result = await _run_in_executor(_fetch)
+        if result is None:
+            self._note_failure()
+        else:
+            self._note_success()
+        return result
 
     async def get_tick(self, symbol: str) -> Optional[dict]:
         """Get latest tick (bid/ask)."""
@@ -137,7 +266,12 @@ class MT5Client:
                 return None
             return {"bid": tick.bid, "ask": tick.ask, "time": tick.time}
 
-        return await _run_in_executor(_fetch)
+        result = await _run_in_executor(_fetch)
+        if result is None:
+            self._note_failure()
+        else:
+            self._note_success()
+        return result
 
     async def open_order(
         self,

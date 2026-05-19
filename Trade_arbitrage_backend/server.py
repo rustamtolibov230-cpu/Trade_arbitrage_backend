@@ -23,6 +23,13 @@ from src.schemas import PairSignal
 from src.spread_tracker import SpreadTracker
 from src.execution import ExecutionEngine
 from src.risk_manager import RiskManager
+from src.cointegration import CointegrationMonitor
+from src.backtest.cost_model import (
+    IC_MARKETS_RAW,
+    validate_profit_targets,
+    format_cost_check_line,
+    check_trade_viability,
+)
 
 # --- Logging ---
 os.makedirs("logs", exist_ok=True)
@@ -60,8 +67,16 @@ else:
 # --- Bot components ---
 mt5_client = MT5Client()
 execution = ExecutionEngine(mt5_client)
-risk_mgr = RiskManager(execution)
+coint_monitor = CointegrationMonitor(PAIRS, mt5_client)
+risk_mgr = RiskManager(execution, coint=coint_monitor)
 trackers = [SpreadTracker(cfg, mt5_client) for cfg in PAIRS]
+
+# Server-lifetime flag for long-running tasks (separate from bot start/stop)
+_server_alive = True
+
+# Set in on_startup by the profit-target sanity check. If False, api_start refuses.
+_cost_check_ok = False
+_cost_check_messages: list[str] = []
 
 # --- WebSocket hub ---
 ws_clients: Set[WebSocket] = set()
@@ -143,6 +158,48 @@ async def api_status():
         "active_pairs": active,
         "daily_pnl": round(execution.get_daily_pnl(), 2),
         "bot_running": _bot_running,
+    }
+
+
+@app.get("/api/cointegration")
+async def api_cointegration():
+    """Current cointegration status for every configured pair."""
+    out = []
+    for cfg in PAIRS:
+        name = f"{cfg.leg_a}/{cfg.leg_b}"
+        state = coint_monitor.get_state(name)
+        if state is None:
+            out.append({
+                "pair": name,
+                "checked": False,
+                "is_cointegrated": False,
+                "reason": "pending first check",
+            })
+            continue
+        out.append({
+            "pair": name,
+            "checked": True,
+            "is_cointegrated": state.is_cointegrated,
+            "p_value": round(state.p_value, 4),
+            "beta": round(state.beta, 6),
+            "alpha": round(state.alpha, 6),
+            "half_life_bars": (
+                round(state.half_life_bars, 2)
+                if state.half_life_bars != float("inf") else None
+            ),
+            "bars_used": state.bars_used,
+            "reason": state.reason,
+            "last_check": state.last_check.isoformat(),
+        })
+    return {
+        "enabled": settings.require_cointegration,
+        "p_threshold": settings.coint_p_threshold,
+        "timeframe": settings.coint_timeframe,
+        "lookback_bars": settings.coint_lookback_bars,
+        "recheck_seconds": settings.coint_recheck_seconds,
+        "min_half_life": settings.coint_min_half_life,
+        "max_half_life": settings.coint_max_half_life,
+        "pairs": out,
     }
 
 
@@ -245,11 +302,32 @@ async def api_start():
         return {"status": "already_running"}
     if not mt5_client.is_connected():
         return {"status": "error", "error": "MT5 not connected — log in first"}
+    if not _cost_check_ok:
+        return {
+            "status": "error",
+            "error": (
+                "Profit-target sanity check failed — one or more pairs have "
+                "profit_target below the minimum vs round-trip cost. "
+                "Fix profit_target or lots in config/settings.py and restart. "
+                "See server logs for the per-pair breakdown."
+            ),
+            "details": _cost_check_messages,
+        }
     _bot_running = True  # set BEFORE creating task to prevent double-start race
     _bot_task = asyncio.create_task(bot_loop())
     await broadcast({"type": "bot_state", "running": True})
     logger.info("Bot STARTED by dashboard")
     return {"status": "started"}
+
+
+@app.get("/api/cost-check")
+async def api_cost_check():
+    """Surfaces the startup profit-target vs cost sanity check to the dashboard."""
+    return {
+        "ok": _cost_check_ok,
+        "safety_factor": settings.profit_target_safety_factor,
+        "messages": _cost_check_messages,
+    }
 
 
 @app.post("/api/stop")
@@ -284,9 +362,12 @@ async def bot_loop():
             cycle += 1
 
             for tracker in trackers:
+                pair_name = f"{tracker.cfg.leg_a}/{tracker.cfg.leg_b}"
+                coint_state = coint_monitor.get_state(pair_name)
                 state = await tracker.compute_spread(
                     timeframe=settings.timeframe,
                     lookback=settings.spread_lookback,
+                    coint_state=coint_state,
                 )
                 if state is None:
                     continue
@@ -303,8 +384,12 @@ async def bot_loop():
                     f"corr={state.correlation:.3f}{corr_warn}"
                 )
 
-                # Generate signal (Z-score entry or emergency stop)
-                signal_obj = tracker.generate_signal(state, is_open)
+                # Generate signal (Z-score entry or emergency stop).
+                # Pass cointegration state + cost model so entries use
+                # OLS-beta-based hedge sizing instead of static lots.
+                signal_obj = tracker.generate_signal(
+                    state, is_open, coint_state, IC_MARKETS_RAW
+                )
                 if signal_obj is None:
                     continue
 
@@ -329,6 +414,31 @@ async def bot_loop():
                         })
                         continue
 
+                    # Runtime cost check — beta sizing can change leg_b enough
+                    # that the trade is no longer viable vs profit_target.
+                    cost_ok, total_cost, ratio = check_trade_viability(
+                        IC_MARKETS_RAW,
+                        signal_obj.leg_a,
+                        signal_obj.leg_b,
+                        signal_obj.leg_a_lot,
+                        signal_obj.leg_b_lot,
+                        tracker.cfg.profit_target,
+                        settings.profit_target_safety_factor,
+                    )
+                    if not cost_ok:
+                        msg = (
+                            f"sized lots make trade unprofitable: "
+                            f"cost=${total_cost:.2f}, target=${tracker.cfg.profit_target:.2f}, "
+                            f"ratio={ratio:.2f}x < {settings.profit_target_safety_factor}x"
+                        )
+                        logger.warning(f"  BLOCKED {tracker.pair_name}: {msg}")
+                        await broadcast({
+                            "type": "risk_block",
+                            "pair": state.pair_name,
+                            "reason": msg,
+                        })
+                        continue
+
                 # Execute
                 logger.info(f">>> {signal_obj.action} | {signal_obj.reason}")
                 success = await execution.execute_signal(signal_obj)
@@ -350,6 +460,25 @@ async def bot_loop():
 @app.on_event("startup")
 async def on_startup():
     """Try MT5 auto-connect from .env; if creds missing/invalid, user logs in from dashboard."""
+    # Profit-target vs round-trip cost sanity gate. Runs before any trading
+    # can start so a misconfigured pair can never bleed live capital.
+    global _cost_check_ok, _cost_check_messages
+    sf = settings.profit_target_safety_factor
+    all_ok, rows = validate_profit_targets(PAIRS, IC_MARKETS_RAW, safety_factor=sf)
+    _cost_check_ok = all_ok
+    _cost_check_messages = [format_cost_check_line(r, sf) for r in rows]
+    for row, line in zip(rows, _cost_check_messages):
+        if row["ok"] and not row.get("error"):
+            logger.info(line)
+        else:
+            logger.error(line)
+    if not all_ok:
+        logger.error(
+            "Profit-target sanity check FAILED — bot start will be blocked. "
+            "Fix profit_target or lots in config/settings.py, or adjust "
+            "profit_target_safety_factor."
+        )
+
     if settings.mt5_login and settings.mt5_password and settings.mt5_server:
         connected = await mt5_client.connect()
         if connected:
@@ -364,6 +493,9 @@ async def on_startup():
     # Always-on tasks — run even when MT5 disconnected / bot stopped
     asyncio.create_task(display_loop())
     asyncio.create_task(trade_monitor_task())
+    asyncio.create_task(
+        coint_monitor.run_periodic(lambda: not _server_alive)
+    )
 
     logger.info("Server ready on http://localhost:8050 — waiting for Start")
 
@@ -374,6 +506,7 @@ async def on_startup():
 
 _profit_target_map = {f"{c.leg_a}/{c.leg_b}": c.profit_target for c in PAIRS}
 _timeout_map = {f"{c.leg_a}/{c.leg_b}": c.max_hold_minutes for c in PAIRS}
+_min_hold_map = {f"{c.leg_a}/{c.leg_b}": c.min_hold_seconds for c in PAIRS}
 
 
 async def trade_monitor_task():
@@ -399,14 +532,25 @@ async def trade_monitor_task():
                             pair.min_profit = pnl
 
                     # --- Profit target ---
+                    # Grace period: bid/ask noise right after entry can swing P&L
+                    # enough to trip the profit target on the very first monitor
+                    # cycle (especially for metals where 0.01 XAG lot moves ~$50
+                    # per $1 silver). Wait min_hold_seconds before honoring it.
+                    age_seconds = (datetime.now(timezone.utc) - pair.entry_time).total_seconds()
+                    min_hold = _min_hold_map.get(pair_name, 20)
                     target = _profit_target_map.get(pair_name, 1.0)
-                    if pnl is not None and pnl >= target:
+                    if pnl is not None and pnl >= target and age_seconds < min_hold:
+                        logger.debug(
+                            f"  [MONITOR] {pair_name}: P&L=${pnl:.2f} >= target but "
+                            f"still in grace ({age_seconds:.0f}s/{min_hold}s)"
+                        )
+                    if pnl is not None and pnl >= target and age_seconds >= min_hold:
                         sig = PairSignal(
                             pair_name=pair_name, action="CLOSE", zscore=0,
                             leg_a=pair.leg_a, leg_b=pair.leg_b,
                             leg_a_side="", leg_b_side="",
                             leg_a_lot=0, leg_b_lot=0,
-                            reason=f"Profit target hit (P&L=${pnl:.2f} >= ${target:.2f})",
+                            reason=f"Profit target hit (P&L=${pnl:.2f} >= ${target:.2f} after {age_seconds:.0f}s)",
                         )
                         logger.info(f">>> PROFIT TARGET | {sig.reason}")
                         success = await execution.execute_signal(sig)
@@ -469,10 +613,13 @@ async def _compute_spreads_data() -> list:
     global _last_spreads
     spreads_data = []
     for tracker in trackers:
+        pair_name = f"{tracker.cfg.leg_a}/{tracker.cfg.leg_b}"
+        coint_state = coint_monitor.get_state(pair_name)
         try:
             state = await tracker.compute_spread(
                 timeframe=settings.timeframe,
                 lookback=settings.spread_lookback,
+                coint_state=coint_state,
             )
         except Exception as e:
             logger.error(f"compute_spread failed for {tracker.pair_name}: {e}")
@@ -488,9 +635,19 @@ async def _compute_spreads_data() -> list:
             "ratio": round(state.ratio, 6),
             "mean": round(state.mean, 6),
             "std": round(state.std, 6),
+            "spread_mode": state.spread_mode,
+            "spread_value": round(state.spread_value, 6),
             "is_open": is_open,
             "pnl": round(pnl, 2) if pnl is not None else None,
             "in_session": tracker._is_in_session(),
+            "cointegrated": coint_state.is_cointegrated if coint_state else None,
+            "coint_p": round(coint_state.p_value, 4) if coint_state else None,
+            "coint_half_life": (
+                round(coint_state.half_life_bars, 1)
+                if coint_state and coint_state.half_life_bars != float("inf")
+                else None
+            ),
+            "coint_reason": coint_state.reason if coint_state else "pending",
         })
     _last_spreads = spreads_data
     return spreads_data
@@ -575,8 +732,9 @@ async def display_loop():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _bot_running
+    global _bot_running, _server_alive
     _bot_running = False
+    _server_alive = False  # signals coint_monitor.run_periodic to exit
     if execution.active_pairs:
         await execution.close_all("shutdown")
     await mt5_client.disconnect()

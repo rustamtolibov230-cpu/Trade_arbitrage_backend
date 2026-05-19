@@ -1,6 +1,8 @@
 MetaTrader5>=5.0.45
 numpy>=1.24.0
 pandas>=2.0.0
+statsmodels>=0.14.0
+scipy>=1.11.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 python-dotenv>=1.0.0
